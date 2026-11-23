@@ -15811,7 +15811,13 @@ fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
     let prepared = external_pool_prepare_request(&route, &pool).unwrap();
-    assert_eq!(prepared.body, Bytes::copy_from_slice(raw));
+    let mut expected: serde_json::Value = serde_json::from_slice(raw).unwrap();
+    expected["cache_control"]["ttl"] = json!("5m");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&prepared.body).unwrap(),
+        expected
+    );
+    assert_eq!(route.effective_raw_body, Bytes::copy_from_slice(raw));
 
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":5,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
@@ -18248,6 +18254,117 @@ data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cac
     assert_eq!(raw.cache_creation_input_tokens, 1_998_336);
     assert_eq!(raw.cache_creation_5m_input_tokens, 0);
     assert_eq!(raw.cache_creation_1h_input_tokens, 1_998_336);
+}
+
+#[test]
+fn external_pool_cache_ttl_only_changes_downstream_usage_and_upstream_is_always_5m() {
+    use crate::model::config::CacheTtlMode::*;
+    let response = json!({
+        "type":"message", "content":[],
+        "usage":{"input_tokens":12,"output_tokens":135,"cache_creation_input_tokens":2000,
+            "cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":2000,"ephemeral_1h_input_tokens":0}}
+    });
+    for mode in [
+        FollowRequestDefault5m,
+        FollowRequestDefault1h,
+        Force5m,
+        Force1h,
+        UpstreamThenRequestDefault5m,
+    ] {
+        for request_ttl in [None, Some("5m"), Some("1h")] {
+            for stream in [false, true] {
+                let raw = Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "model":"claude-opus-4-8","max_tokens":512,"stream":stream,
+                        "cache_control":request_ttl.map(|ttl| json!({"type":"ephemeral","ttl":ttl})).unwrap_or_else(|| json!({"type":"ephemeral"})),
+                        "system":[{"type":"text","text":"stable cache prompt ".repeat(8000),
+                            "cache_control":request_ttl.map(|ttl| json!({"type":"ephemeral","ttl":ttl})).unwrap_or_else(|| json!({"type":"ephemeral"}))}],
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .unwrap(),
+                );
+                let mut route = raw_test_route(&raw);
+                route.cache_ttl_mode = mode;
+                for projection_mode in [
+                    ExternalPoolUsageProjectionMode::CurrentPathPolicy,
+                    ExternalPoolUsageProjectionMode::PassThrough,
+                ] {
+                    let mut pool = test_pool("http://pool.example.com", false);
+                    pool.usage_projection_mode = projection_mode;
+                    for body_mode in [
+                        ExternalPoolRequestBodyMode::RawPassthrough,
+                        ExternalPoolRequestBodyMode::Normalized,
+                    ] {
+                        pool.request_body_mode = body_mode;
+                        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+                        let outbound: serde_json::Value =
+                            serde_json::from_slice(&prepared.body).unwrap();
+                        assert_eq!(outbound["cache_control"]["ttl"], "5m");
+                        assert_eq!(outbound["system"][0]["cache_control"]["ttl"], "5m");
+                    }
+                    assert_eq!(route.effective_raw_body, raw);
+                    let projection = projection_context(&route, &pool, 0);
+                    let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+                    let (usage, billing) = if stream {
+                        let event = format!(
+                            "event: message_delta\ndata: {}\n\n",
+                            json!({"type":"message_delta","usage":response["usage"]})
+                        );
+                        let rewritten = rewrite_sse_event_usage(
+                            event.as_bytes(),
+                            projection.as_ref(),
+                            Some(&capture),
+                        );
+                        (
+                            event_data_value(&rewritten)["usage"].clone(),
+                            external_pool_billing_from_capture_ref(&route, &pool, &capture),
+                        )
+                    } else {
+                        let body = process_non_stream_response_usage(
+                            Bytes::from(serde_json::to_vec(&response).unwrap()),
+                            Some(&route),
+                            projection.as_ref(),
+                            std::iter::empty::<String>(),
+                        );
+                        let usage = serde_json::from_slice::<serde_json::Value>(&body.body)
+                            .unwrap()["usage"]
+                            .clone();
+                        (
+                            usage,
+                            external_pool_billing_from_capture(&route, &pool, body.usage_capture),
+                        )
+                    };
+                    if projection_mode == ExternalPoolUsageProjectionMode::PassThrough {
+                        assert!(projection.is_none());
+                        assert_eq!(usage, response["usage"]);
+                        continue;
+                    }
+                    let projection = projection.as_ref().unwrap();
+                    assert_eq!(
+                        projection.prompt_cache_bounds.write_ttl,
+                        Some(Duration::from_secs(300))
+                    );
+                    let hour = mode == Force1h
+                        || (mode != Force5m
+                            && (request_ttl == Some("1h")
+                                || (request_ttl.is_none() && mode == FollowRequestDefault1h)));
+                    let key = if hour {
+                        "ephemeral_1h_input_tokens"
+                    } else {
+                        "ephemeral_5m_input_tokens"
+                    };
+                    assert!(usage["cache_creation_input_tokens"].as_i64().unwrap() > 0);
+                    assert_eq!(
+                        usage["cache_creation"][key], usage["cache_creation_input_tokens"],
+                        "{mode:?}/{request_ttl:?}/{stream}"
+                    );
+                    let billing = billing.unwrap();
+                    assert_eq!(billing.raw_cost_usage.cache_creation_5m_input_tokens, 2000);
+                    assert_eq!(billing.raw_cost_usage.cache_creation_1h_input_tokens, 0);
+                }
+            }
+        }
+    }
 }
 
 /// External pools resolve the write TTL from the route mode; "channel first" follows a channel

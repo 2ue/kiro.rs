@@ -35,6 +35,8 @@
 
 ## In Progress
 
+- [上游缓存 TTL 与下游 usage 展示分离](topics/upstream-cache-ttl-and-downstream-usage.md)：外部池请求显式固定5m，展示仍按路由选择；main实施后合并forced-main，claude-main独立移植。
+
 - [库存身份去重与模型列表交互](topics/inventory-identity-and-model-editing.md)：统一密钥查重，保留上游模型 ID、统一清空/撤销草稿交互；main 与 forced-main 发布，claude-main 仅同步模型部分。
 
 ## Next

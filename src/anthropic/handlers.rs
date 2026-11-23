@@ -1462,6 +1462,10 @@ fn prompt_cache_bounds_for_policy(policy: &CacheRoutePolicy) -> PromptCacheBound
     )
 }
 
+fn local_prompt_cache_state_bounds(policy: &CacheRoutePolicy) -> PromptCacheBounds {
+    prompt_cache_bounds_for_policy(policy).with_write_ttl(super::cache::CacheWriteTtl::FiveMinutes)
+}
+
 fn reported_usage_config_for_policy(policy: ReportedUsagePathPolicy) -> ReportedUsageConfig {
     ReportedUsageConfig {
         default: policy,
@@ -6382,11 +6386,13 @@ fn prepare_usage_context_with_inference_attempt_budget(
     let policy = cache_route.policy;
     let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
     let strategy_type = policy.cache_type;
+    let request_cache_ttl =
+        super::cache::RequestCacheTtl::from_request(payload).with_top_level(top_level_cache_ttl);
+    let prompt_cache_state_bounds = local_prompt_cache_state_bounds(&policy);
     let cache_write_ttl = (strategy_type != PromptCacheStrategyType::NoCache).then(|| {
         super::cache::resolve_cache_write_ttl(
             policy.cache_ttl.local.for_local(),
-            super::cache::RequestCacheTtl::from_request(payload)
-                .with_top_level(top_level_cache_ttl),
+            request_cache_ttl,
             false,
         )
     });
@@ -6429,7 +6435,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
                     payload,
                     input_tokens,
                     prompt_cache_model,
-                    prompt_cache_bounds_for_policy(&policy),
+                    prompt_cache_state_bounds,
                     policy.kiro_rs_tool,
                 )),
                 None,
@@ -6442,7 +6448,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
                     payload,
                     input_tokens,
                     prompt_cache_model,
-                    prompt_cache_bounds_for_policy(&policy),
+                    prompt_cache_state_bounds,
                     policy.kiro_rs_tool_plus.tracker_policy(),
                 )),
                 None,
@@ -6606,10 +6612,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
-        prompt_cache_bounds: match cache_write_ttl {
-            Some(ttl) => prompt_cache_bounds_for_policy(&policy).with_write_ttl(ttl),
-            None => prompt_cache_bounds_for_policy(&policy),
-        },
+        prompt_cache_bounds: prompt_cache_state_bounds,
         stable_segment_cache_policy: policy.stable_segment,
         reported_cache_usage_policy,
         cache_hit_shaping: CacheHitShapingContext {

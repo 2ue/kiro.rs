@@ -135,8 +135,8 @@ pub struct PromptCacheBounds {
     pub max_entries_global: usize,
     pub entry_ttl: Duration,
     pub estimated_bytes_limit: u64,
-    /// Lifetime of entries written by this request, from the route's cache TTL mode. `None`
-    /// keeps the TTL of the request's last breakpoint. Always capped at `entry_ttl`.
+    /// Lifetime of entries written by this request, independently of downstream usage display.
+    /// `None` keeps the last breakpoint's TTL. Always capped at `entry_ttl`.
     pub write_ttl: Option<Duration>,
 }
 
@@ -168,7 +168,7 @@ impl PromptCacheBounds {
         }
     }
 
-    /// Sets the lifetime of entries this request writes (the route's resolved cache TTL).
+    /// Sets the lifetime of entries this request writes, independently of usage display TTL.
     pub fn with_write_ttl(mut self, ttl: crate::anthropic::cache::CacheWriteTtl) -> Self {
         self.write_ttl = Some(match ttl {
             crate::anthropic::cache::CacheWriteTtl::FiveMinutes => DEFAULT_PROMPT_CACHE_TTL,
@@ -181,7 +181,7 @@ impl PromptCacheBounds {
         ttl.min(self.entry_ttl)
     }
 
-    /// Lifetime for a new entry: the route's write TTL when set, else the breakpoint's TTL.
+    /// Lifetime for a new entry: the actual write TTL when set, else the breakpoint's TTL.
     fn write_entry_ttl(self, breakpoint_ttl: Duration) -> Duration {
         self.effective_ttl(self.write_ttl.unwrap_or(breakpoint_ttl))
     }

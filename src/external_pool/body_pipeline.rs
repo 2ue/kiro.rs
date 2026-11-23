@@ -2,6 +2,7 @@ use super::{model_pipeline, *};
 use crate::anthropic::body_capabilities::{
     ExternalBodyBytesPlan, ExternalBodyPlan, PayloadGuardStagePlan, RawModelStagePlan,
 };
+use crate::anthropic::request_facts::rewrite_upstream_cache_ttl_5m;
 use std::collections::{HashMap, VecDeque};
 
 pub(super) struct PreparedExternalRequest {
@@ -19,6 +20,25 @@ pub(super) struct NormalizedRequestBase {
 
 #[allow(clippy::result_large_err)]
 pub(super) fn prepare_request(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+) -> Result<PreparedExternalRequest, ExternalPoolError> {
+    let mut prepared = prepare_request_body(route, pool)?;
+    prepared.body =
+        rewrite_upstream_cache_ttl_5m(&prepared.body).map_err(|error| ExternalPoolError {
+            status: Some(StatusCode::BAD_REQUEST),
+            message: format!("invalid upstream cache TTL request body: {error}"),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: None,
+            protocol_error: None,
+            raw_upstream_error: None,
+        })?;
+    Ok(prepared)
+}
+
+#[allow(clippy::result_large_err)]
+fn prepare_request_body(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
 ) -> Result<PreparedExternalRequest, ExternalPoolError> {

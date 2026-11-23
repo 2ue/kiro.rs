@@ -1450,10 +1450,207 @@ fn skip_json_container(
     Err(JsonScanError::Malformed)
 }
 
+#[derive(Clone, Copy)]
+enum CacheControlScope {
+    Request,
+    Content,
+    Marker,
+}
+
+pub(crate) fn rewrite_upstream_cache_ttl_5m(
+    raw: &Bytes,
+) -> Result<Bytes, RawMessagesBodyProbeError> {
+    if raw.len() > MAX_MESSAGES_BODY_SIZE {
+        return Err(RawMessagesBodyProbeError::BodyTooLarge);
+    }
+    let mut patches = Vec::new();
+    let mut budget = JsonScanBudget::new(MAX_RAW_BODY_PROBE_WORK_UNITS);
+    let end = scan_cache_ttl_patches(
+        raw,
+        0,
+        0,
+        CacheControlScope::Request,
+        &mut budget,
+        &mut patches,
+    )?;
+    if skip_json_ws(raw, end, &mut budget)? != raw.len() {
+        return Err(RawMessagesBodyProbeError::MalformedTopLevelJson);
+    }
+    if patches.is_empty() {
+        return Ok(raw.clone());
+    }
+    patches.sort_unstable_by_key(|(span, _)| span.start);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut cursor = 0;
+    for (span, replacement) in patches {
+        out.extend_from_slice(&raw[cursor..span.start]);
+        out.extend_from_slice(replacement);
+        cursor = span.end;
+    }
+    out.extend_from_slice(&raw[cursor..]);
+    Ok(Bytes::from(out))
+}
+
+fn scan_cache_ttl_patches(
+    bytes: &[u8],
+    start: usize,
+    parent_depth: usize,
+    scope: CacheControlScope,
+    budget: &mut JsonScanBudget,
+    patches: &mut Vec<(std::ops::Range<usize>, &'static [u8])>,
+) -> Result<usize, JsonScanError> {
+    let start = skip_json_ws(bytes, start, budget)?;
+    let container = bytes.get(start).copied().ok_or(JsonScanError::Malformed)?;
+    if !matches!(container, b'{' | b'[') {
+        return skip_json_value(bytes, start, parent_depth, budget);
+    }
+    let depth = parent_depth + 1;
+    budget.observe_depth(depth)?;
+    budget.consume(1)?;
+    let close = if container == b'{' { b'}' } else { b']' };
+    let mut i = start + 1;
+    let mut ephemeral = false;
+    let mut ttl_span: Option<std::ops::Range<usize>> = None;
+    loop {
+        i = skip_json_ws(bytes, i, budget)?;
+        if bytes.get(i) == Some(&close) {
+            budget.consume(1)?;
+            if ephemeral {
+                if let Some(span) = ttl_span {
+                    if &bytes[span.clone()] != b"\"5m\"" {
+                        patches.push((span, b"\"5m\""));
+                    }
+                } else {
+                    patches.push((i..i, b",\"ttl\":\"5m\""));
+                }
+            }
+            return Ok(i + 1);
+        }
+        let key = if container == b'{' {
+            let end = skip_json_string(bytes, i, budget)?;
+            let key = if end - i <= MAX_TOP_LEVEL_PROBED_KEY_ENCODED_BYTES {
+                budget.consume(end - i)?;
+                serde_json::from_slice::<Cow<'_, str>>(&bytes[i..end])
+                    .map_err(|_| JsonScanError::Malformed)?
+            } else {
+                Cow::Borrowed("")
+            };
+            i = skip_json_ws(bytes, end, budget)?;
+            if bytes.get(i) != Some(&b':') {
+                return Err(JsonScanError::Malformed);
+            }
+            budget.consume(1)?;
+            i = skip_json_ws(bytes, i + 1, budget)?;
+            key
+        } else {
+            Cow::Borrowed("")
+        };
+        let child = match (scope, container, key.as_ref()) {
+            (CacheControlScope::Request | CacheControlScope::Content, b'{', "cache_control") => {
+                Some(CacheControlScope::Marker)
+            }
+            (CacheControlScope::Request, b'{', "system" | "tools" | "messages")
+            | (CacheControlScope::Content, b'{', "content")
+            | (CacheControlScope::Content, b'[', _) => Some(CacheControlScope::Content),
+            _ => None,
+        };
+        let end = if let Some(child) = child {
+            scan_cache_ttl_patches(bytes, i, depth, child, budget, patches)?
+        } else {
+            skip_json_value(bytes, i, depth, budget)?
+        };
+        if matches!(scope, CacheControlScope::Marker) {
+            if key == "type" {
+                ephemeral = end - i <= 9 * MAX_JSON_ASCII_ESCAPE_BYTES + 2
+                    && serde_json::from_slice::<Cow<'_, str>>(&bytes[i..end])
+                        .is_ok_and(|value| value == "ephemeral");
+            } else if key == "ttl" {
+                ttl_span = Some(i..end);
+            }
+        }
+        i = skip_json_ws(bytes, end, budget)?;
+        match bytes.get(i) {
+            Some(b',') => {
+                budget.consume(1)?;
+                i += 1;
+            }
+            Some(byte) if *byte == close => {}
+            _ => return Err(JsonScanError::Malformed),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn upstream_cache_ttl_5m_only_patches_protocol_markers() {
+        let raw = Bytes::from_static(br#" {
+          "model":"test", "cache_control":{"type":"ephemeral","ttl":"1h"},
+          "system":[{"type":"text","text":"keep ttl=1h","cache_control":{"type":"ephemeral","ttl":3600}}],
+          "tools":[{"name":"x","input_schema":{"properties":{"cache_control":{"type":"ephemeral","ttl":"1h"}}},"cache_control":{"type":"ephemeral"}}],
+          "messages":[{"role":"user","content":[
+            {"type":"text","text":"literal cache_control ttl 1h","cache_control":{"type":"ephemeral","ttl":"5m"}},
+            {"type":"tool_result","content":[{"type":"text","text":"nested","cache_control":{"type":"ephemeral","ttl":"1h"}}]},
+            {"type":"tool_use","input":{"cache_control":{"type":"ephemeral","ttl":"1h"}}}
+          ]}],
+          "metadata":{"cache_control":{"type":"ephemeral","ttl":"1h"}}
+        } "#);
+        let outbound = rewrite_upstream_cache_ttl_5m(&raw).unwrap();
+        let expected = String::from_utf8_lossy(&raw)
+            .replace("\"ttl\":3600", "\"ttl\":\"5m\"")
+            .replace(
+                "\"model\":\"test\", \"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}",
+                "\"model\":\"test\", \"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}",
+            )
+            .replace(
+                "\"cache_control\":{\"type\":\"ephemeral\"}}]",
+                "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}}]",
+            )
+            .replace(
+                "\"text\":\"nested\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}",
+                "\"text\":\"nested\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}",
+            );
+        assert_eq!(outbound.as_ref(), expected.as_bytes());
+        let unchanged = rewrite_upstream_cache_ttl_5m(&outbound).unwrap();
+        assert_eq!(unchanged.as_ptr(), outbound.as_ptr());
+    }
+
+    #[test]
+    fn upstream_cache_ttl_5m_handles_escaped_keys_and_preserves_unmarked_bodies() {
+        let raw = Bytes::from_static(br#"{"cache_\u0063ontrol":{"t\u0079pe":"ephem\u0065ral","t\u0074l":"1h"},"messages":[]}"#);
+        let outbound = rewrite_upstream_cache_ttl_5m(&raw).unwrap();
+        assert_eq!(
+            outbound,
+            String::from_utf8_lossy(&raw)
+                .replace("\"1h\"", "\"5m\"")
+                .as_bytes()
+        );
+        for raw in [
+            br#" {"messages":[{"role":"user","content":"no marker"}]} "#.as_slice(),
+            br#"{"cache_control":null,"messages":[]}"#,
+            br#"{"cache_control":{"type":"other","ttl":"1h"},"messages":[]}"#,
+            br#"{"cache_control":{"type":"ephemeral","ttl":"5m"},"messages":[]}"#,
+        ] {
+            let raw = Bytes::copy_from_slice(raw);
+            assert_eq!(
+                rewrite_upstream_cache_ttl_5m(&raw).unwrap().as_ptr(),
+                raw.as_ptr()
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_cache_ttl_5m_rejects_incomplete_or_excessively_nested_bodies() {
+        assert!(rewrite_upstream_cache_ttl_5m(&Bytes::from_static(br#"{"messages":["#)).is_err());
+        let nested = format!("{{\"messages\":{}0{}}}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(
+            rewrite_upstream_cache_ttl_5m(&Bytes::from(nested)).unwrap_err(),
+            RawMessagesBodyProbeError::NestingTooDeep
+        );
+    }
 
     #[test]
     fn raw_hints_ignore_nested_model_without_top_level_model() {

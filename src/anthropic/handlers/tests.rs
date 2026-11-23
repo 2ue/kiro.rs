@@ -3288,6 +3288,32 @@ fn usage_field(value: &Value, field: &str) -> i64 {
         .unwrap_or_else(|| panic!("missing usage.{field}: {value}"))
 }
 
+#[test]
+fn local_cache_ttl_display_modes_do_not_change_prompt_cache_lifetime() {
+    use crate::model::config::{CacheTtlMode, CacheTtlPolicy};
+    for mode in [
+        CacheTtlMode::FollowRequestDefault5m,
+        CacheTtlMode::FollowRequestDefault1h,
+        CacheTtlMode::Force5m,
+        CacheTtlMode::Force1h,
+        CacheTtlMode::UpstreamThenRequestDefault5m,
+    ] {
+        let policy = CacheRoutePolicy {
+            cache_ttl: CacheTtlPolicy {
+                local: mode,
+                external_pool: mode,
+            },
+            ..Config::default().legacy_cache_route_policy_default()
+        };
+        let bounds = local_prompt_cache_state_bounds(&policy);
+        assert_eq!(
+            bounds.write_ttl,
+            Some(std::time::Duration::from_secs(300)),
+            "{mode:?}"
+        );
+    }
+}
+
 /// A local route's cache TTL mode decides the downstream `cache_creation` split, the usage
 /// record and the cost; "follow request" honours `cache_control.ttl`.
 #[test]

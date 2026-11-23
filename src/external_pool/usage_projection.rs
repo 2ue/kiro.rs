@@ -6,8 +6,6 @@ struct ExternalUsageProjectionState {
     observed_cache_read_evidence: bool,
     /// The channel reported a 1-hour cache write in any usage event of this response.
     observed_upstream_1h_write: bool,
-    /// Write TTL resolved for the committed usage; sets the lifetime of the entries it writes.
-    committed_write_ttl: Option<crate::anthropic::cache::CacheWriteTtl>,
 }
 
 /// Kiro-RS Tool Plus 策略在外部池上的整形参数。
@@ -287,6 +285,9 @@ fn build_template(
         .supports_prompt_caching_for(&model)
         .unwrap_or(true);
 
+    let prompt_cache_bounds = route
+        .prompt_cache_bounds
+        .with_write_ttl(crate::anthropic::cache::CacheWriteTtl::FiveMinutes);
     let raw_input_tokens = if route.request_input_tokens > 0 {
         route.request_input_tokens
     } else {
@@ -327,7 +328,7 @@ fn build_template(
                     scope.clone(),
                     profile.as_ref(),
                     route.prompt_cache_target_read_ratio,
-                    route.prompt_cache_bounds,
+                    prompt_cache_bounds,
                 );
                 let simulated_usage = profile.as_ref().and_then(|profile| {
                     CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
@@ -344,7 +345,7 @@ fn build_template(
                     payload,
                     raw_input_tokens,
                     &model,
-                    route.prompt_cache_bounds,
+                    prompt_cache_bounds,
                     route.kiro_rs_tool_cache_policy,
                 );
                 let policy = route.kiro_rs_tool_cache_policy.normalized();
@@ -363,7 +364,7 @@ fn build_template(
                     payload,
                     raw_input_tokens,
                     &model,
-                    route.prompt_cache_bounds,
+                    prompt_cache_bounds,
                     route.kiro_rs_tool_plus_cache_policy.tracker_policy(),
                 );
                 let simulated_usage = CacheSimulation::from_prompt_cache_split_input(plan.usage());
@@ -438,7 +439,7 @@ fn build_template(
         stable_segment_prompt_cache_plan: None,
         stable_segment_cache_policy,
         prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
-        prompt_cache_bounds: route.prompt_cache_bounds,
+        prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
         pricing_catalog: route.pricing_catalog.clone(),
@@ -496,27 +497,16 @@ impl ExternalUsageProjectionContext {
     pub(super) fn resolve_write_ttl(
         &self,
         upstream_usage: Option<&CacheUsage>,
-        commit: bool,
+        _commit: bool,
     ) -> crate::anthropic::cache::CacheWriteTtl {
         let mut state = self.state.lock();
         state.observed_upstream_1h_write |=
             upstream_usage.is_some_and(|usage| usage.cache_creation_1h_input_tokens > 0);
-        let ttl = crate::anthropic::cache::resolve_cache_write_ttl(
+        crate::anthropic::cache::resolve_cache_write_ttl(
             self.cache_ttl_mode,
             self.request_cache_ttl,
             state.observed_upstream_1h_write,
-        );
-        if commit {
-            state.committed_write_ttl = Some(ttl);
-        }
-        ttl
-    }
-
-    fn committed_bounds(&self) -> PromptCacheBounds {
-        match self.state.lock().committed_write_ttl {
-            Some(ttl) => self.prompt_cache_bounds.with_write_ttl(ttl),
-            None => self.prompt_cache_bounds,
-        }
+        )
     }
 
     pub(super) fn record_success(&self) {
@@ -526,7 +516,7 @@ impl ExternalUsageProjectionContext {
         if !self.cache_state_enabled {
             return;
         }
-        let bounds = self.committed_bounds();
+        let bounds = self.prompt_cache_bounds;
         if let Some(plus) = self.kiro_rs_tool_plus {
             if let Some(config) = plus.shaper().frequency_control() {
                 let _ = self
