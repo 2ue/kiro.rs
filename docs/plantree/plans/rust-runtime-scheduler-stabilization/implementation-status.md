@@ -2,6 +2,9 @@
 
 Last reviewed: 2026-11-11 Asia/Shanghai
 
+2026-11-23 completed follow-up: [账号级 rawUsage 统一双字段及发布证据](topics/upstream-raw-usage-accounting.md#最终交付与发布证据2026-11-23).
+三模式已完成 main/forced/claude 的完整质量检查及镜像发布；生产 k1–k3 仍为上一轮 `0.0.262`，抓包关闭。本项无剩余实现或发布 TODO。
+
 ## 当前交接：端点/Region/版本生命周期（2026-11-11）
 
 当前阶段：已实现并完成 FREE 账号真实上游验证，详见 [设计文档 §13](topics/endpoint-rotation-and-client-version-lifecycle.md#13-2026-11-11-真实上游验证矩阵)。
