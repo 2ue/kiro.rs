@@ -241,7 +241,8 @@ function formatClientError(record: UsageRecord): string | undefined {
 }
 
 function usageRecordAccountContext(record: UsageRecord): string {
-  const attempt = record.credentialAttempts?.at(-1)
+  const attempts = record.credentialAttempts || []
+  const attempt = attempts[attempts.length - 1]
   const id = record.credentialId ?? attempt?.credentialId
   const label = record.credentialLabel || attempt?.credentialLabel
   return id != null ? ` · 账号 ${credentialIdentityLabel(id, label)}` : ''
