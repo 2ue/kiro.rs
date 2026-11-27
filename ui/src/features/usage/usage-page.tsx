@@ -82,6 +82,7 @@ import {
   formatAttemptSummary,
   formatAttemptChain,
   formatExternalAttemptChain,
+  credentialIdentityLabel,
   upstreamModelLabel,
   upstreamResponseModelMismatch,
 } from './usage-helpers'
@@ -129,8 +130,7 @@ function routeAccountLabel(record: UsageRecord, credentialLabel?: string): strin
     const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
     return `外部账号 #${record.externalPoolId ?? '-'}${name}`
   }
-  const label = credentialLabel ? ` ${credentialLabel}` : ''
-  return `账号 #${record.credentialId ?? '-'}${label}`
+  return `账号 ${record.credentialId != null ? credentialIdentityLabel(record.credentialId, credentialLabel) : '-'}`
 }
 
 function parseRouteSelection(value: RouteSelectionValue): ParsedRouteSelection {

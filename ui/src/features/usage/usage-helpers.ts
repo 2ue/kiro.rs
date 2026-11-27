@@ -1,6 +1,9 @@
 import type { BadgeProps } from '@/components/ui'
 import type { UsageRecord, UsageSource } from '@/types/api'
 import { formatNumber } from '@/lib/format'
+import { credentialIdentityLabel } from './usage-identity'
+
+export { credentialIdentityLabel } from './usage-identity'
 
 export type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -101,7 +104,7 @@ export function attemptOutcomeLabel(
 
 export function formatAttemptChain(record: UsageRecord): string {
   return (record.credentialAttempts || [])
-    .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
+    .map((attempt) => `${credentialIdentityLabel(attempt.credentialId, attempt.credentialLabel)}(${attemptOutcomeLabel(attempt)})`)
     .join(' > ')
 }
 
@@ -120,8 +123,10 @@ export function formatAttemptSummary(record: UsageRecord): string {
 export function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
     .map(
-      (attempt) =>
-        `外部账号 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+      (attempt) => {
+        const label = attempt.poolName?.trim()
+        return `外部账号 #${attempt.poolId}${label ? ` ${label}` : ''}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+      }
     )
     .join(' > ')
 }

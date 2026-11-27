@@ -69,7 +69,7 @@ use crate::anthropic::{
         UsageDashboardCredentialAggregate, UsageDashboardResponse, UsageExternalPoolRiskCostConfig,
         UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageOverviewExternalResponse,
         UsageOverviewLocalResponse, UsageOverviewRankingsResponse, UsageOverviewResponse,
-        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
+        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse, UsageRecord,
         UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
         UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
     },
@@ -2779,9 +2779,10 @@ impl AdminService {
             .map(|entry| {
                 credential_runtime_item_from_snapshot(entry, self.token_manager.current_id())
             });
-        let result = self
-            .usage_recorder
-            .query_credential_error_page(credential_id, page, limit);
+        let mut result =
+            self.usage_recorder
+                .query_credential_error_page(credential_id, page, limit);
+        self.enrich_usage_record_labels(&mut result.records);
         CredentialDiagnosticsResponse {
             credential_id,
             runtime,
@@ -5499,7 +5500,9 @@ impl AdminService {
 
     /// 查询请求级 usage 记录。
     pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
-        self.usage_recorder.query(query)
+        let mut result = self.usage_recorder.query(query);
+        self.enrich_usage_record_labels(&mut result.records);
+        result
     }
 
     /// 分页查询请求级 usage 记录。
@@ -5509,7 +5512,128 @@ impl AdminService {
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
-        self.usage_recorder.query_page(query, page, limit)
+        let mut result = self.usage_recorder.query_page(query, page, limit);
+        self.enrich_usage_record_labels(&mut result.records);
+        result
+    }
+
+    fn enrich_usage_record_labels(&self, records: &mut [UsageRecord]) {
+        let mut missing_ids = HashSet::new();
+        for record in records.iter() {
+            if let Some(id) = record.credential_id {
+                if record
+                    .credential_label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    missing_ids.insert(id);
+                }
+            }
+            for attempt in &record.credential_attempts {
+                if attempt
+                    .credential_label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    missing_ids.insert(attempt.credential_id);
+                }
+            }
+            if let Some(samples) = record
+                .error_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("selectionFailure"))
+                .and_then(|failure| failure.get("sampledAccounts"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for id in samples.iter().filter_map(|sample| {
+                    let has_label = sample
+                        .get("accountLabel")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|label| !label.trim().is_empty());
+                    (!has_label)
+                        .then(|| sample.get("accountId").and_then(serde_json::Value::as_u64))
+                        .flatten()
+                }) {
+                    missing_ids.insert(id);
+                }
+            }
+        }
+        let current_labels = self
+            .token_manager
+            .credential_display_labels(&missing_ids.into_iter().collect::<Vec<_>>());
+
+        for record in records {
+            let mut labels: HashMap<u64, String> = HashMap::new();
+            if let (Some(id), Some(label)) =
+                (record.credential_id, record.credential_label.as_ref())
+            {
+                if !label.trim().is_empty() {
+                    labels.insert(id, label.clone());
+                }
+            }
+            for attempt in &record.credential_attempts {
+                if let Some(label) = attempt
+                    .credential_label
+                    .as_ref()
+                    .filter(|label| !label.trim().is_empty())
+                {
+                    labels
+                        .entry(attempt.credential_id)
+                        .or_insert_with(|| label.clone());
+                }
+            }
+
+            let label_for = |id: u64| {
+                labels
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| current_labels.get(&id).cloned())
+            };
+            if let Some(id) = record.credential_id {
+                if record
+                    .credential_label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    record.credential_label = label_for(id);
+                }
+            }
+            for attempt in &mut record.credential_attempts {
+                if attempt
+                    .credential_label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    attempt.credential_label = label_for(attempt.credential_id);
+                }
+            }
+            if let Some(samples) = record
+                .error_metadata
+                .as_mut()
+                .and_then(|metadata| metadata.get_mut("selectionFailure"))
+                .and_then(|failure| failure.get_mut("sampledAccounts"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for sample in samples {
+                    let Some(id) = sample.get("accountId").and_then(serde_json::Value::as_u64)
+                    else {
+                        continue;
+                    };
+                    let Some(label) = label_for(id) else {
+                        continue;
+                    };
+                    if let Some(sample) = sample.as_object_mut() {
+                        let has_label = sample
+                            .get("accountLabel")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|existing| !existing.trim().is_empty());
+                        if !has_label {
+                            sample.insert("accountLabel".to_string(), label.into());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 获取 usage 汇总。

@@ -3208,6 +3208,36 @@ impl MultiTokenManager {
             })
     }
 
+    pub fn credential_display_labels(&self, ids: &[u64]) -> HashMap<u64, String> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        let requested = ids.iter().copied().collect::<HashSet<_>>();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| requested.contains(&entry.id))
+            .filter_map(|entry| {
+                let label = entry
+                    .credentials
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+                    .or_else(|| {
+                        entry
+                            .credentials
+                            .endpoint
+                            .as_ref()
+                            .map(|endpoint| format!("#{} {}", entry.id, endpoint))
+                    });
+                label.map(|label| (entry.id, label))
+            })
+            .collect()
+    }
+
     /// 获取错误响应热路径使用的 Retry-After 提示。
     ///
     /// 该方法只基于本进程内存中的冷却状态计算，不同步 PgSQL 统计或 Redis 调度运行态。
@@ -3741,6 +3771,21 @@ impl MultiTokenManager {
             if bucket.len() < sample_limit {
                 bucket.push(RejectedAccountSample {
                     account_id: entry.id,
+                    account_label: entry
+                        .credentials
+                        .email
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+                        .or_else(|| {
+                            entry
+                                .credentials
+                                .endpoint
+                                .as_ref()
+                                .map(|endpoint| format!("#{} {}", entry.id, endpoint))
+                        }),
                     reason,
                     rpm_limit: Some(effective_rpm(entry, global_rpm)),
                     in_flight: Some(entry.in_flight_requests),
