@@ -2,9 +2,10 @@ import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { ModalPortal, ModalRoot } from './modal-portal'
 
 /** Side panel built on the Radix dialog: slides in from the right, full width on phones. */
-const Sheet = DialogPrimitive.Root
+const Sheet = ModalRoot
 const SheetTrigger = DialogPrimitive.Trigger
 const SheetClose = DialogPrimitive.Close
 
@@ -15,7 +16,7 @@ const SheetOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      'fixed inset-0 z-50 bg-secondary/25',
+      'pointer-events-auto fixed inset-0 z-0 bg-secondary/25',
       'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
       className
     )}
@@ -31,7 +32,7 @@ interface SheetContentProps extends React.ComponentPropsWithoutRef<typeof Dialog
 
 const SheetContent = React.forwardRef<React.ElementRef<typeof DialogPrimitive.Content>, SheetContentProps>(
   ({ className, children, width = 'sm:max-w-lg', onOpenAutoFocus, ...props }, ref) => (
-    <DialogPrimitive.Portal>
+    <ModalPortal>
       <SheetOverlay />
       <DialogPrimitive.Content
         ref={ref}
@@ -43,7 +44,7 @@ const SheetContent = React.forwardRef<React.ElementRef<typeof DialogPrimitive.Co
           ;(event.currentTarget as HTMLElement | null)?.focus()
         }}
         className={cn(
-          'fixed inset-y-0 right-0 z-50 flex h-full w-full flex-col bg-background shadow-2xl outline-none',
+          'pointer-events-auto fixed inset-y-0 right-0 z-10 flex h-full w-full flex-col bg-background shadow-2xl outline-none',
           'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:slide-in-from-right data-[state=closed]:slide-out-to-right',
           'data-[state=open]:duration-300 data-[state=closed]:duration-200',
           width,
@@ -57,7 +58,7 @@ const SheetContent = React.forwardRef<React.ElementRef<typeof DialogPrimitive.Co
           <span className="sr-only">关闭</span>
         </DialogPrimitive.Close>
       </DialogPrimitive.Content>
-    </DialogPrimitive.Portal>
+    </ModalPortal>
   )
 )
 SheetContent.displayName = 'SheetContent'

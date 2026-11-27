@@ -41,5 +41,6 @@ Greenfield work must preserve the compatibility and dispatch semantics above unl
 8. [账号列表两层分类](topics/credential-classification.md)
 9. [库存身份去重与模型列表交互](topics/inventory-identity-and-model-editing.md)
 10. [上游缓存 TTL 与下游 usage 展示分离](topics/upstream-cache-ttl-and-downstream-usage.md)
+    - [弹窗、抽屉与二次确认层级](topics/modal-layer-ordering.md)
 11. [Roadmap](roadmap.md)
 12. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)

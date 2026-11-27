@@ -2,8 +2,9 @@ import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { ModalPortal, ModalRoot } from './modal-portal'
 
-const Dialog = DialogPrimitive.Root
+const Dialog = ModalRoot
 const DialogTrigger = DialogPrimitive.Trigger
 const DialogPortal = DialogPrimitive.Portal
 const DialogClose = DialogPrimitive.Close
@@ -15,7 +16,7 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      'fixed inset-0 z-50 bg-secondary/40 backdrop-blur-sm',
+      'pointer-events-auto fixed inset-0 z-0 bg-secondary/40 backdrop-blur-sm',
       'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0',
       className
     )}
@@ -28,6 +29,7 @@ interface DialogContentProps
   extends React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> {
   width?: string
   hideClose?: boolean
+  layer?: 'default' | 'confirm'
 }
 
 /** Whether a pointer event landed inside the dialog box, judged by position. */
@@ -48,7 +50,7 @@ function pointInside(element: HTMLElement | null, event: Event): boolean {
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, children, width = 'max-w-2xl', hideClose, onPointerDownOutside, onInteractOutside, ...props }, ref) => {
+>(({ className, children, width = 'max-w-2xl', hideClose, layer, onPointerDownOutside, onInteractOutside, ...props }, ref) => {
   const contentRef = React.useRef<HTMLDivElement | null>(null)
   const nestedLayerOpenAtPointerDown = React.useRef(false)
   const setRefs = React.useCallback(
@@ -77,12 +79,12 @@ const DialogContent = React.forwardRef<
   }
 
   return (
-  <DialogPortal>
+  <ModalPortal layer={layer}>
     <DialogOverlay />
     <DialogPrimitive.Content
       ref={setRefs}
       className={cn(
-        'fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl bg-background shadow-2xl',
+        'pointer-events-auto fixed left-1/2 top-1/2 z-10 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl bg-background shadow-2xl',
         'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
         width,
         className
@@ -105,7 +107,7 @@ const DialogContent = React.forwardRef<
         </DialogPrimitive.Close>
       )}
     </DialogPrimitive.Content>
-  </DialogPortal>
+  </ModalPortal>
   )
 })
 DialogContent.displayName = DialogPrimitive.Content.displayName
