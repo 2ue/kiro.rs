@@ -110,6 +110,15 @@ Host-safety rules:
 
 ## Docker And Release Gates
 
+### Maintained Branch Boundaries
+
+The following branch rules were explicitly confirmed on 2026-11-27:
+
+- Fetch and compare with the remote before changing or releasing `main`, `claude-main`, or `forced-main`; local branches may be stale.
+- `claude-main` is a hard fork of `main`. Never merge either branch into the other. Port shared fixes independently against the destination source.
+- `forced-main` extends `main`; merging `main` into `forced-main` is allowed. Never merge `forced-main` into `main`.
+- Preserve each release line's own Cargo package/version and tag namespace: `vX.Y.Z`, `claude-vX.Y.Z`, and `forced-vX.Y.Z`, respectively.
+
 The end-to-end Docker gate is not complete when frontend stages pass. It must reach Rust dependency fetch, Rust compilation, final image construction, and image export, then run the expected image smoke/metadata checks.
 
 At the `v0.0.102` source commit, the registered runtime plan recorded a Docker run that built frontends but timed out during `cargo fetch --locked`. The builder and validation residue were cleaned. That result is neither a compilation failure nor a Docker pass.
