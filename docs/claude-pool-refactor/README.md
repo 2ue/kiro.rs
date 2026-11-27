@@ -4,7 +4,7 @@
 
 目标：把 `kiro-rs` 改造成纯 Claude Code 协议（Anthropic Messages）账号的调度网关。账号以 `baseUrl + key` 接入；网关负责路由调度、模型限制与映射、优先级管理，并对下游 usage 做整形。所有 Kiro 相关能力删除。
 
-分支 `claude-main`（原名 `fork/claude-pool`，2026-11-17 改名），worktree `../2ue_kiro.rs-claude-pool`，从 `main@8946fe38`（kiro-rs 0.0.252）切出，只单向合入 main，永不合回。独立发布：tag `claude-vX.Y.Z`，镜像 `ghcr.io/2ue/claude-pool`，门禁对 `claude-main` 触发（见根 README「分支与发布」）。
+分支 `claude-main`（原名 `fork/claude-pool`，2026-11-17 改名），worktree `../2ue_kiro.rs-claude-pool`，从 `main@8946fe38`（kiro-rs 0.0.252）切出，是 main 的硬分叉，禁止与 main 双向合并；共用修复必须独立移植。forced-main 允许接收 main 合并，禁止反向合入 main（2026-11-27 明确规则）。修改与发版前先 fetch，不能假定本地分支最新。独立发布：tag `claude-vX.Y.Z`，镜像 `ghcr.io/2ue/claude-pool`，门禁对 `claude-main` 触发（见根 README「分支与发布」）。
 
 ## 阅读顺序
 

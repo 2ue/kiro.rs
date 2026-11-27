@@ -43,7 +43,7 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
       {children}
       <Dialog open={Boolean(request)} onOpenChange={(open) => !open && close(false)}>
         {request && (
-          <DialogContent width="max-w-md">
+          <DialogContent width="max-w-md" layer="confirm">
             <DialogHeader>
               <DialogTitle>{request.title}</DialogTitle>
             </DialogHeader>
