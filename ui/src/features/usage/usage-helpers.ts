@@ -3,7 +3,7 @@ import type { UsageRecord, UsageSource } from '@/types/api'
 import { formatNumber } from '@/lib/format'
 import { credentialIdentityLabel } from './usage-identity'
 
-export { credentialIdentityLabel } from './usage-identity'
+export { credentialIdentityLabel, usageRecordCredentialIdentity } from './usage-identity'
 
 export type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -128,6 +128,12 @@ export function formatExternalAttemptChain(record: UsageRecord): string {
         return `外部账号 #${attempt.poolId}${label ? ` ${label}` : ''}(${attempt.status ?? attempt.errorType ?? attempt.action})`
       }
     )
+    .join(' > ')
+}
+
+export function formatCredentialAttemptCsv(record: UsageRecord): string {
+  return (record.credentialAttempts || [])
+    .map((attempt) => `${credentialIdentityLabel(attempt.credentialId, attempt.credentialLabel)} (${attemptOutcomeLabel(attempt)})`)
     .join(' > ')
 }
 
