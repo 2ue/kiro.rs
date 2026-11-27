@@ -49,6 +49,8 @@ pub enum AccountRejectReason {
 #[serde(rename_all = "camelCase")]
 pub struct RejectedAccountSample {
     pub account_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
     pub reason: AccountRejectReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_limit: Option<u32>,
@@ -140,7 +142,22 @@ impl KiroCredentialAttempt {
     }
 
     fn compact(&self) -> String {
-        let label = format!("#{}", self.credential_id);
+        let id_label = format!("#{}", self.credential_id);
+        let account_name = self
+            .credential_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(|label| {
+                label
+                    .strip_prefix(&format!("{} ", id_label))
+                    .unwrap_or(label)
+                    .to_string()
+            })
+            .filter(|label| label != &id_label);
+        let label = account_name
+            .map(|name| format!("{} {}", id_label, name))
+            .unwrap_or(id_label);
         let outcome = self
             .status
             .map(|status| status.to_string())
@@ -401,6 +418,7 @@ mod tests {
 
         let compact = attempt.compact();
         assert!(compact.contains("api_rate_limit"));
+        assert!(compact.contains("#42 diagnostic@example.com"));
         assert!(compact.contains("raw_upstream_error"));
         assert!(compact.contains("source=kiro_api"));
         assert!(compact.contains("status=429"));

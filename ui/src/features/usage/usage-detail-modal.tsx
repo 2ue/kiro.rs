@@ -15,6 +15,7 @@ import { ModalShell } from '@/components/patterns'
 import {
   formatAttemptChain,
   formatAttemptSummary,
+  credentialIdentityLabel,
   formatExternalAttemptChain,
   formatLatency,
   attemptActionLabel,
@@ -74,6 +75,7 @@ function formatJsonBlock(value: unknown): string {
 
 type SelectionFailureSample = {
   accountId?: number
+  accountLabel?: string
   poolId?: number
   statusCode?: number
   reason?: string
@@ -133,7 +135,7 @@ function selectionFailureLabel(selectionFailure: SelectionFailureMetadata): stri
           if (!isRecord(sample)) return null
           const typed = sample as SelectionFailureSample
           const identity = typeof typed.accountId === 'number'
-            ? `#${typed.accountId}`
+            ? `账号 ${credentialIdentityLabel(typed.accountId, typed.accountLabel)}`
             : typeof typed.poolId === 'number'
               ? `池 #${typed.poolId}`
               : null
@@ -238,46 +240,56 @@ function formatClientError(record: UsageRecord): string | undefined {
   ].join('\n')
 }
 
+function usageRecordAccountContext(record: UsageRecord): string {
+  const attempt = record.credentialAttempts?.at(-1)
+  const id = record.credentialId ?? attempt?.credentialId
+  const label = record.credentialLabel || attempt?.credentialLabel
+  return id != null ? ` · 账号 ${credentialIdentityLabel(id, label)}` : ''
+}
+
 function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   const items: ErrorDiagnosticItem[] = []
   const seen = new Set<string>()
   const selectionFailure = extractSelectionFailure(record.errorMetadata)
+  const accountContext = usageRecordAccountContext(record)
 
-  appendDiagnostic(items, seen, '上游错误片段', formatRawUpstreamError(record.rawUpstreamError), 'warning')
-  appendDiagnostic(items, seen, '系统处理 / 限制错误', formatSystemError(record), 'error')
+  appendDiagnostic(items, seen, `上游错误片段${accountContext}`, formatRawUpstreamError(record.rawUpstreamError), 'warning')
+  appendDiagnostic(items, seen, `系统处理 / 限制错误${accountContext}`, formatSystemError(record), 'error')
   if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
-    appendDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
+    appendDiagnostic(items, seen, `内部错误摘要${accountContext}`, record.errorMessage, 'error')
   }
 
   record.credentialAttempts?.forEach((attempt) => {
+    const identity = `账号 ${credentialIdentityLabel(attempt.credentialId, attempt.credentialLabel)}`
     appendDiagnostic(
       items,
       seen,
-      `本地上游错误片段 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.action || '-'}`,
+      `本地上游错误片段 #${attempt.attempt} · ${identity} · ${attempt.statusText || attempt.status || attempt.action || '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendDiagnostic(
       items,
       seen,
-      `本地上游尝试 #${attempt.attempt} · 账号 #${attempt.credentialId} · ${attempt.statusText || attempt.status || attempt.errorType || attempt.action || '-'}`,
+      `本地上游尝试 #${attempt.attempt} · ${identity} · ${attempt.statusText || attempt.status || attempt.errorType || attempt.action || '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
   })
 
   record.externalAttempts?.forEach((attempt) => {
+    const identity = `外部账号 #${attempt.poolId}${attempt.poolName?.trim() ? ` ${attempt.poolName.trim()}` : ''}`
     appendDiagnostic(
       items,
       seen,
-      `外部池上游错误片段 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      `外部池上游错误片段 #${attempt.attempt} · ${identity} · ${attempt.status ?? attempt.action ?? '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendDiagnostic(
       items,
       seen,
-      `外部池上游尝试 #${attempt.attempt} · 外部池 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      `外部池上游尝试 #${attempt.attempt} · ${identity} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
@@ -293,7 +305,7 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   }
 
-  appendDiagnostic(items, seen, '返回给下游的错误', formatClientError(record), 'muted')
+  appendDiagnostic(items, seen, `返回给下游的错误${accountContext}`, formatClientError(record), 'muted')
   return items
 }
 
@@ -332,6 +344,7 @@ export function UsageDetailModal({
     record.routeKind === 'external_pool'
     && !!record.upstreamModel
     && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
+  const accountContext = usageRecordAccountContext(record)
   const errorDiagnostics = buildErrorDiagnostics(record)
 
   return (
@@ -367,7 +380,7 @@ export function UsageDetailModal({
                 <DetailField label="模型解析说明" value={record.modelResolutionNote} />
               </div>
             )}
-            <DetailField label="账号" value={record.credentialId != null ? `#${record.credentialId}${record.credentialLabel ? ' ' + record.credentialLabel : ''}` : '-'} />
+            <DetailField label="账号" value={record.credentialId != null ? credentialIdentityLabel(record.credentialId, record.credentialLabel) : '-'} />
             {record.routeKind === 'external_pool' && (
               <DetailField label="外部账号" value={`#${record.externalPoolId ?? '-'}${record.externalPoolName ? ' ' + record.externalPoolName : ''}`} />
             )}
@@ -630,10 +643,7 @@ export function UsageDetailModal({
                     <TableRow key={`${a.attempt}-${a.credentialId}-${a.durationMs}`}>
                       <TableCell>{a.attempt}</TableCell>
                       <TableCell>
-                        <div className="font-medium">#{a.credentialId}</div>
-                        {a.credentialLabel && (
-                          <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.credentialLabel}</div>
-                        )}
+                        <div className="font-medium">{credentialIdentityLabel(a.credentialId, a.credentialLabel)}</div>
                       </TableCell>
                       <TableCell className="max-w-[160px] truncate text-xs">{a.model || '-'}</TableCell>
                       <TableCell>{a.statusText || (a.status != null ? String(a.status) : '-')}</TableCell>
@@ -677,8 +687,7 @@ export function UsageDetailModal({
                     <TableRow key={`${a.attempt}-${a.poolId}-${a.durationMs}`}>
                       <TableCell>{a.attempt}</TableCell>
                       <TableCell>
-                        <div className="font-medium">#{a.poolId}</div>
-                        <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.poolName}</div>
+                        <div className="max-w-[220px] truncate font-medium" title={a.poolName}>#{a.poolId}{a.poolName ? ` ${a.poolName}` : ''}</div>
                       </TableCell>
                       <TableCell>
                         <div className="max-w-[220px] truncate font-mono text-xs" title={a.outboundModel || ''}>
@@ -703,7 +712,7 @@ export function UsageDetailModal({
 
         {/* 错误详情 */}
         <div>
-          <SectionTitle>内部错误详情</SectionTitle>
+          <SectionTitle>内部错误详情{accountContext}</SectionTitle>
           <pre className="max-h-60 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
             {record.errorDetail || record.errorMessage || '-'}
           </pre>
@@ -711,7 +720,7 @@ export function UsageDetailModal({
 
         {record.errorMetadata != null && (
           <div>
-            <SectionTitle>错误元数据</SectionTitle>
+            <SectionTitle>错误元数据{accountContext}</SectionTitle>
             <pre className="max-h-72 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
               {formatJsonBlock(record.errorMetadata)}
             </pre>

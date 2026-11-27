@@ -1407,7 +1407,7 @@ export function CredentialCard({
                             <div className="mt-2 space-y-1 border-t border-border pt-2">
                               {record.credentialAttempts.map((attempt) => (
                                 <div key={`${record.id}-${attempt.attempt}-${attempt.credentialId}`} className="rounded bg-background px-2 py-1">
-                                  <span className="font-semibold">#{attempt.credentialId}</span>
+                                  <span className="font-semibold">#{attempt.credentialId}{attempt.credentialLabel ? ` ${attempt.credentialLabel.replace(/^#\d+\s*/, '')}` : ''}</span>
                                   <span className="ml-2 text-muted-foreground">{attempt.action}</span>
                                   {attempt.errorType && <span className="ml-2 text-destructive">{attempt.errorType}</span>}
                                   {attempt.errorMessage && <span className="ml-2 text-muted-foreground">{attempt.errorMessage}</span>}
