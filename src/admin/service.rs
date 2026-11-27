@@ -2,6 +2,8 @@
 
 #[path = "management.rs"]
 pub(crate) mod management;
+#[path = "usage_identity.rs"]
+mod usage_identity;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use crate::anthropic::{
         USAGE_OVERVIEW_HOURLY_MAX_DAYS, UsageAccountLatencyResponse, UsageAccountRiskCostConfig,
         UsageAccountRiskQuery, UsageAccountRiskResponse, UsageDashboardResponse,
         UsageOverviewRankRow, UsageOverviewRankingsResponse, UsageOverviewResponse,
-        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
+        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse, UsageRecord,
         UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
         UsageRecordsResult, UsageRouteLatencyResponse, UsageSummary, resolve_usage_overview_spec,
     },
@@ -2106,7 +2108,9 @@ impl AdminService {
 
     /// 查询请求级 usage 记录。
     pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
-        self.usage_recorder.query(query)
+        let mut result = self.usage_recorder.query(query);
+        self.enrich_usage_account_names(&mut result.records);
+        result
     }
 
     /// 分页查询请求级 usage 记录。
@@ -2116,7 +2120,30 @@ impl AdminService {
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
-        self.usage_recorder.query_page(query, page, limit)
+        let mut result = self.usage_recorder.query_page(query, page, limit);
+        self.enrich_usage_account_names(&mut result.records);
+        result
+    }
+
+    fn enrich_usage_account_names(&self, records: &mut [UsageRecord]) {
+        let mut names = HashMap::new();
+        for record in records.iter() {
+            usage_identity::collect_names(record, &mut names);
+        }
+        if records
+            .iter()
+            .any(|record| usage_identity::needs_names(record, &names))
+            && let Ok(accounts) = self.list_accounts()
+        {
+            for account in accounts {
+                if !account.name.trim().is_empty() {
+                    names.entry(account.id).or_insert(account.name);
+                }
+            }
+        }
+        for record in records {
+            usage_identity::enrich_names(record, &names);
+        }
     }
 
     /// 获取 usage 汇总。

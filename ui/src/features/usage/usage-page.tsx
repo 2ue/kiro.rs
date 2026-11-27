@@ -81,6 +81,8 @@ import {
   formatLatency,
   sourceLabel,
   formatExternalAttemptChain,
+  usageRecordAccountId,
+  usageRecordAccountIdentity,
   upstreamModelLabel,
   upstreamResponseModelMismatch,
 } from './usage-helpers'
@@ -119,8 +121,7 @@ function usageInputTotal(record: UsageRecord): number {
 }
 
 function routeAccountLabel(record: UsageRecord): string {
-  const name = record.accountName ? ` ${record.accountName}` : ''
-  return `账号 #${record.accountId ?? '-'}${name}`
+  return `账号 ${usageRecordAccountIdentity(record)}`
 }
 
 function parseAccountSelection(value: AccountSelectionValue): number | undefined {
@@ -199,6 +200,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'upstream_response_model',
     'account_id',
     'account_name',
+    'account_attempts',
     'usage_source',
     'total_input_tokens',
     'compat_input_tokens',
@@ -226,8 +228,9 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.model,
     upstreamModelLabel(record) === '-' ? '' : upstreamModelLabel(record),
     record.upstreamResponseModel ?? '',
-    record.accountId,
-    record.accountName,
+    usageRecordAccountId(record),
+    usageRecordAccountIdentity(record),
+    formatExternalAttemptChain(record),
     record.usageSource,
     record.totalInputTokens,
     record.compatInputTokens,

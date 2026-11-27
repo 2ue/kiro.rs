@@ -2,6 +2,9 @@ import type { BadgeProps } from '@/components/ui'
 import type { UsageRecord, UsageSource } from '@/types/api'
 import { formatNumber } from '@/lib/format'
 import { routePrefixForEndpoint, UNKNOWN_USAGE_ROUTE } from '@/features/routes/route-utils'
+import { accountIdentityLabel } from './usage-identity'
+
+export { accountIdentityLabel, usageRecordAccountId, usageRecordAccountIdentity } from './usage-identity'
 
 export type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -90,7 +93,7 @@ export function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
     .map(
       (attempt) =>
-        `账号 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`
+        `账号 ${accountIdentityLabel(attempt.poolId, attempt.poolName)}(${attempt.status ?? attempt.errorType ?? attempt.action})`
     )
     .join(' > ')
 }

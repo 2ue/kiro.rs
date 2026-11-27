@@ -16,6 +16,9 @@ import { RequestApiKeyIdDisplay } from './request-api-key-id'
 import { UsageCostBreakdown,UsageCostTiles,usageRecordCostModel } from './usage-billing'
 import {
 attemptActionLabel,
+accountIdentityLabel,
+usageRecordAccountId,
+usageRecordAccountIdentity,
 errorSourceLabel,
 formatExternalAttemptChain,
 formatLatency,
@@ -76,7 +79,10 @@ function formatJsonBlock(value: unknown): string {
 
 type SelectionFailureSample = {
   accountId?: number
+  accountLabel?: string
+  accountName?: string
   poolId?: number
+  poolName?: string
   statusCode?: number
   reason?: string
   primaryReason?: string
@@ -135,9 +141,9 @@ function selectionFailureLabel(selectionFailure: SelectionFailureMetadata): stri
           if (!isRecord(sample)) return null
           const typed = sample as SelectionFailureSample
           const identity = typeof typed.accountId === 'number'
-            ? `#${typed.accountId}`
+            ? `账号 ${accountIdentityLabel(typed.accountId, typed.accountLabel || typed.accountName)}`
             : typeof typed.poolId === 'number'
-              ? `池 #${typed.poolId}`
+              ? `账号 ${accountIdentityLabel(typed.poolId, typed.poolName)}`
               : null
           const state = typeof typed.statusCode === 'number'
             ? String(typed.statusCode)
@@ -244,25 +250,27 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
   const items: ErrorDiagnosticItem[] = []
   const seen = new Set<string>()
   const selectionFailure = extractSelectionFailure(record.errorMetadata)
+  const identity = usageRecordAccountIdentity(record)
+  const accountContext = identity === '-' ? '' : ` · 账号 ${identity}`
 
-  appendDiagnostic(items, seen, '上游错误片段', formatRawUpstreamError(record.rawUpstreamError), 'warning')
-  appendDiagnostic(items, seen, '系统处理 / 限制错误', formatSystemError(record), 'error')
+  appendDiagnostic(items, seen, `上游错误片段${accountContext}`, formatRawUpstreamError(record.rawUpstreamError), 'warning')
+  appendDiagnostic(items, seen, `系统处理 / 限制错误${accountContext}`, formatSystemError(record), 'error')
   if (record.errorDetail && record.errorMessage && record.errorDetail !== record.errorMessage) {
-    appendDiagnostic(items, seen, '内部错误摘要', record.errorMessage, 'error')
+    appendDiagnostic(items, seen, `内部错误摘要${accountContext}`, record.errorMessage, 'error')
   }
 
   record.externalAttempts?.forEach((attempt) => {
     appendDiagnostic(
       items,
       seen,
-      `账号上游错误片段 #${attempt.attempt} · 账号 #${attempt.poolId} · ${attempt.status ?? attempt.action ?? '-'}`,
+      `账号上游错误片段 #${attempt.attempt} · 账号 ${accountIdentityLabel(attempt.poolId, attempt.poolName)} · ${attempt.status ?? attempt.action ?? '-'}`,
       formatRawUpstreamError(attempt.rawUpstreamError),
       'warning'
     )
     appendDiagnostic(
       items,
       seen,
-      `账号上游尝试 #${attempt.attempt} · 账号 #${attempt.poolId} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
+      `账号上游尝试 #${attempt.attempt} · 账号 ${accountIdentityLabel(attempt.poolId, attempt.poolName)} · ${attempt.status ?? attempt.errorType ?? attempt.action ?? '-'}`,
       attempt.errorMessage || attempt.errorType,
       'error'
     )
@@ -278,7 +286,7 @@ function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
     )
   }
 
-  appendDiagnostic(items, seen, '返回给下游的错误', formatClientError(record), 'muted')
+  appendDiagnostic(items, seen, `返回给下游的错误${accountContext}`, formatClientError(record), 'muted')
   return items
 }
 
@@ -317,6 +325,9 @@ export function UsageDetailModal({
     && !!record.upstreamModel
     && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
   const errorDiagnostics = buildErrorDiagnostics(record)
+  const accountId = usageRecordAccountId(record)
+  const accountIdentity = usageRecordAccountIdentity(record)
+  const accountContext = accountIdentity === '-' ? '' : ` · 账号 ${accountIdentity}`
 
   return (
     <ModalShell open={open} onClose={onClose} title="请求明细" width="max-w-4xl">
@@ -354,14 +365,14 @@ export function UsageDetailModal({
             )}
             <div>
               <div className="text-xs text-muted-foreground">账号</div>
-              {record.accountId != null ? (
+              {accountId != null ? (
                 <Link
-                  to={`/accounts?q=${encodeURIComponent(`#${record.accountId}`)}`}
+                  to={`/accounts?q=${encodeURIComponent(`#${accountId}`)}`}
                   className="break-all text-sm text-primary underline-offset-2 hover:underline"
                   title="到账号页查看这个账号"
                   onClick={onClose}
                 >
-                  #{record.accountId}{record.accountName ? ` ${record.accountName}` : ''}
+                  {accountIdentity}
                 </Link>
               ) : (
                 <div className="text-sm">-</div>
@@ -621,8 +632,7 @@ export function UsageDetailModal({
                     <TableRow key={`${a.attempt}-${a.poolId}-${a.durationMs}`}>
                       <TableCell>{a.attempt}</TableCell>
                       <TableCell>
-                        <div className="font-medium">#{a.poolId}</div>
-                        <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.poolName}</div>
+                        <div className="break-all font-medium">{accountIdentityLabel(a.poolId, a.poolName)}</div>
                       </TableCell>
                       <TableCell>
                         <div className="max-w-[220px] truncate font-mono text-xs" title={a.outboundModel || ''}>
@@ -647,7 +657,7 @@ export function UsageDetailModal({
 
         {/* 错误详情 */}
         <div>
-          <SectionTitle>内部错误详情</SectionTitle>
+          <SectionTitle>内部错误详情{accountContext}</SectionTitle>
           <pre className="max-h-60 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
             {record.errorDetail || record.errorMessage || '-'}
           </pre>
@@ -655,7 +665,7 @@ export function UsageDetailModal({
 
         {record.errorMetadata != null && (
           <div>
-            <SectionTitle>错误元数据</SectionTitle>
+            <SectionTitle>错误元数据{accountContext}</SectionTitle>
             <pre className="max-h-72 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
               {formatJsonBlock(record.errorMetadata)}
             </pre>
