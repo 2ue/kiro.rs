@@ -5520,14 +5520,13 @@ impl AdminService {
     fn enrich_usage_record_labels(&self, records: &mut [UsageRecord]) {
         let mut missing_ids = HashSet::new();
         for record in records.iter() {
-            if let Some(id) = record.credential_id {
-                if record
+            if let Some(id) = record.credential_id
+                && record
                     .credential_label
                     .as_deref()
                     .is_none_or(|label| label.trim().is_empty())
-                {
-                    missing_ids.insert(id);
-                }
+            {
+                missing_ids.insert(id);
             }
             for attempt in &record.credential_attempts {
                 if attempt
@@ -5566,10 +5565,9 @@ impl AdminService {
             let mut labels: HashMap<u64, String> = HashMap::new();
             if let (Some(id), Some(label)) =
                 (record.credential_id, record.credential_label.as_ref())
+                && !label.trim().is_empty()
             {
-                if !label.trim().is_empty() {
-                    labels.insert(id, label.clone());
-                }
+                labels.insert(id, label.clone());
             }
             for attempt in &record.credential_attempts {
                 if let Some(label) = attempt
@@ -5589,14 +5587,13 @@ impl AdminService {
                     .cloned()
                     .or_else(|| current_labels.get(&id).cloned())
             };
-            if let Some(id) = record.credential_id {
-                if record
+            if let Some(id) = record.credential_id
+                && record
                     .credential_label
                     .as_deref()
                     .is_none_or(|label| label.trim().is_empty())
-                {
-                    record.credential_label = label_for(id);
-                }
+            {
+                record.credential_label = label_for(id);
             }
             for attempt in &mut record.credential_attempts {
                 if attempt

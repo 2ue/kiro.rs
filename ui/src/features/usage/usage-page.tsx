@@ -81,8 +81,9 @@ import {
   sourceLabel,
   formatAttemptSummary,
   formatAttemptChain,
+  formatCredentialAttemptCsv,
   formatExternalAttemptChain,
-  credentialIdentityLabel,
+  usageRecordCredentialIdentity,
   upstreamModelLabel,
   upstreamResponseModelMismatch,
 } from './usage-helpers'
@@ -130,7 +131,7 @@ function routeAccountLabel(record: UsageRecord, credentialLabel?: string): strin
     const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
     return `外部账号 #${record.externalPoolId ?? '-'}${name}`
   }
-  return `账号 ${record.credentialId != null ? credentialIdentityLabel(record.credentialId, credentialLabel) : '-'}`
+  return `账号 ${usageRecordCredentialIdentity({ ...record, credentialLabel: credentialLabel || record.credentialLabel })}`
 }
 
 function parseRouteSelection(value: RouteSelectionValue): ParsedRouteSelection {
@@ -243,8 +244,10 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     'route_subtype',
     'credential_id',
     'credential_label',
+    'credential_attempts',
     'external_pool_id',
     'external_pool_name',
+    'external_attempts',
     'usage_source',
     'total_input_tokens',
     'compat_input_tokens',
@@ -274,10 +277,12 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.upstreamResponseModel ?? '',
     record.routeKind,
     record.routeSubtype,
-    record.credentialId,
-    record.credentialLabel,
+    record.credentialId ?? record.credentialAttempts?.[record.credentialAttempts.length - 1]?.credentialId,
+    usageRecordCredentialIdentity(record),
+    formatCredentialAttemptCsv(record),
     record.externalPoolId,
     record.externalPoolName,
+    formatExternalAttemptChain(record),
     record.usageSource,
     record.totalInputTokens,
     record.compatInputTokens,
@@ -1115,11 +1120,9 @@ function RecordsView({
                         {/* 调用链路 */}
                         <TableCell>
                           {attemptChain ? (
-                            <div
-                              className="max-w-[220px] truncate text-xs font-medium text-primary"
-                              title={`${attemptSummary} · ${attemptChain}`}
-                            >
-                              {attemptSummary}
+                            <div className="max-w-[220px]" title={`${attemptSummary} · ${attemptChain}`}>
+                              <div className="truncate text-xs font-medium text-primary">{attemptChain}</div>
+                              <div className="truncate text-[0.65rem] text-muted-foreground">{attemptSummary}</div>
                             </div>
                           ) : null}
                           {externalChain && (

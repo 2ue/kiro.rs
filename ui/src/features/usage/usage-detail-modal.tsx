@@ -16,6 +16,7 @@ import {
   formatAttemptChain,
   formatAttemptSummary,
   credentialIdentityLabel,
+  usageRecordCredentialIdentity,
   formatExternalAttemptChain,
   formatLatency,
   attemptActionLabel,
@@ -241,11 +242,8 @@ function formatClientError(record: UsageRecord): string | undefined {
 }
 
 function usageRecordAccountContext(record: UsageRecord): string {
-  const attempts = record.credentialAttempts || []
-  const attempt = attempts[attempts.length - 1]
-  const id = record.credentialId ?? attempt?.credentialId
-  const label = record.credentialLabel || attempt?.credentialLabel
-  return id != null ? ` · 账号 ${credentialIdentityLabel(id, label)}` : ''
+  const identity = usageRecordCredentialIdentity(record)
+  return identity !== '-' ? ` · 账号 ${identity}` : ''
 }
 
 function buildErrorDiagnostics(record: UsageRecord): ErrorDiagnosticItem[] {
@@ -381,7 +379,7 @@ export function UsageDetailModal({
                 <DetailField label="模型解析说明" value={record.modelResolutionNote} />
               </div>
             )}
-            <DetailField label="账号" value={record.credentialId != null ? credentialIdentityLabel(record.credentialId, record.credentialLabel) : '-'} />
+            <DetailField label="账号" value={usageRecordCredentialIdentity(record)} />
             {record.routeKind === 'external_pool' && (
               <DetailField label="外部账号" value={`#${record.externalPoolId ?? '-'}${record.externalPoolName ? ' ' + record.externalPoolName : ''}`} />
             )}
